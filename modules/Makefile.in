@@ -85,6 +85,7 @@ PROGS := cdrbuild.yate cdrcombine.yate cdrfile.yate regexroute.yate \
 	server/mrcpspeech.yate \
 	server/presence.yate server/subscription.yate \
 	server/users.yate \
+	server/redisdb.yate \
 	$(JUSTSIG) \
 	server/analogdetect.yate \
 	server/cache.yate \
@@ -348,6 +349,9 @@ server/mysqldb.yate: EXTERNLIBS = $(MYSQL_LIB)
 
 server/sqlitedb.yate: EXTERNFLAGS = $(SQLITE_INC)
 server/sqlitedb.yate: EXTERNLIBS = $(SQLITE_LIB)
+
+server/redisdb.yate: LOCALFLAGS =-I$(BOOST_INC) -I@top_srcdir@/libs/yrediscli -fexceptions
+server/redisdb.yate: LOCALLIBS = -L$(BOOST_LIB) -lboost_thread -lpthread
 
 client/alsachan.yate: EXTERNLIBS = -lasound
 
