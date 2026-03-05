@@ -355,6 +355,133 @@ type gateway struct {
 	mqttServer *mqtt.Server
 }
 
+type eventRow struct {
+	ID       string `json:"id"`
+	DeviceID string `json:"device_id"`
+	Ts       int64  `json:"ts"`
+	Kind     string `json:"kind"`
+	Proto    string `json:"proto"`
+	Payload  string `json:"payload"`
+}
+
+type commandRow struct {
+	CommandID string `json:"command_id"`
+	DeviceID  string `json:"device_id"`
+	Payload   string `json:"payload"`
+	Status    string `json:"status"`
+	CreatedTs int64  `json:"created_ts"`
+}
+
+type alarmRow struct {
+	ID             string `json:"id"`
+	DeviceID       string `json:"device_id"`
+	RuleID         string `json:"rule_id"`
+	StartTs        int64  `json:"start_ts"`
+	EndTs         *int64 `json:"end_ts,omitempty"`
+	Level          string `json:"level"`
+	Acked          int    `json:"acked"`
+	AckTs         *int64 `json:"ack_ts,omitempty"`
+	PayloadSnapshot string `json:"payload_snapshot"`
+	CreatedTs      int64  `json:"created_ts"`
+}
+
+func parseEventLines(ret string) []eventRow {
+	lines := strings.Split(strings.TrimSpace(ret), "\n")
+	var out []eventRow
+	for i, ln := range lines {
+		ln = strings.TrimRight(ln, "\r")
+		if i == 0 || ln == "" {
+			continue
+		}
+		fields := strings.SplitN(ln, "\t", 6)
+		for len(fields) < 6 {
+			fields = append(fields, "")
+		}
+		var ts int64
+		fmt.Sscanf(fields[2], "%d", &ts)
+		out = append(out, eventRow{
+			ID:       fields[0],
+			DeviceID: fields[1],
+			Ts:       ts,
+			Kind:     fields[3],
+			Proto:    fields[4],
+			Payload:  fields[5],
+		})
+	}
+	return out
+}
+
+func parseCommandLines(ret string) []commandRow {
+	lines := strings.Split(strings.TrimSpace(ret), "\n")
+	var out []commandRow
+	for i, ln := range lines {
+		ln = strings.TrimRight(ln, "\r")
+		if i == 0 || ln == "" {
+			continue
+		}
+		fields := strings.SplitN(ln, "\t", 5)
+		for len(fields) < 5 {
+			fields = append(fields, "")
+		}
+		var createdTs int64
+		fmt.Sscanf(fields[4], "%d", &createdTs)
+		out = append(out, commandRow{
+			CommandID: fields[0],
+			DeviceID:  fields[1],
+			Payload:   fields[2],
+			Status:    fields[3],
+			CreatedTs: createdTs,
+		})
+	}
+	return out
+}
+
+func parseAlarmLines(ret string) []alarmRow {
+	lines := strings.Split(strings.TrimSpace(ret), "\n")
+	var out []alarmRow
+	for i, ln := range lines {
+		ln = strings.TrimRight(ln, "\r")
+		if i == 0 || ln == "" {
+			continue
+		}
+		fields := strings.SplitN(ln, "\t", 10)
+		for len(fields) < 10 {
+			fields = append(fields, "")
+		}
+		var startTs, createdTs int64
+		fmt.Sscanf(fields[3], "%d", &startTs)
+		fmt.Sscanf(fields[9], "%d", &createdTs)
+		var endTs, ackTs *int64
+		if fields[4] != "" {
+			var v int64
+			if _, err := fmt.Sscanf(fields[4], "%d", &v); err == nil {
+				endTs = &v
+			}
+		}
+		if fields[7] != "" {
+			var v int64
+			if _, err := fmt.Sscanf(fields[7], "%d", &v); err == nil {
+				ackTs = &v
+			}
+		}
+		acked := 0
+		fmt.Sscanf(fields[6], "%d", &acked)
+		out = append(out, alarmRow{
+			ID:              fields[0],
+			DeviceID:        fields[1],
+			RuleID:          fields[2],
+			StartTs:         startTs,
+			EndTs:           endTs,
+			Level:           fields[5],
+			Acked:           acked,
+			AckTs:           ackTs,
+			PayloadSnapshot: fields[8],
+			CreatedTs:       createdTs,
+		})
+	}
+	return out
+}
+
 func (g *gateway) yateAuth(ctx context.Context, device, token, proto, peer string) (bool, string) {
 	resp, err := g.yate.call(ctx, "iot.auth", map[string]string{
 		"device": device,
@@ -373,10 +500,10 @@ func (g *gateway) yateAuth(ctx context.Context, device, token, proto, peer strin
 
 func (g *gateway) yateUplink(ctx context.Context, device, token, proto, kind string, tsSec int64, payload []byte, authed bool) (bool, string) {
 	p := map[string]string{
-		"device": device,
-		"proto":  proto,
-		"kind":   kind,
-		"ts":     fmt.Sprintf("%d", tsSec),
+		"device":  device,
+		"proto":   proto,
+		"kind":    kind,
+		"ts":      fmt.Sprintf("%d", tsSec),
 		"payload": string(payload),
 	}
 	if token != "" {
@@ -392,7 +519,157 @@ func (g *gateway) yateUplink(ctx context.Context, device, token, proto, kind str
 	if resp.Params["error"] != "" {
 		return false, resp.Params["error"]
 	}
-	return resp.Ret == "ok", resp.Ret
+	if resp.Ret != "ok" {
+		return false, resp.Ret
+	}
+	g.evaluateRulesAndWebhooks(ctx, device, kind, tsSec, payload)
+	return true, resp.Ret
+}
+
+type ruleRow struct {
+	RuleID     string `json:"rule_id"`
+	Name       string `json:"name"`
+	DeviceID   string `json:"device_id"`
+	Kind       string `json:"kind"`
+	KeyName    string `json:"key_name"`
+	Op         string `json:"op"`
+	Value      string `json:"value"`
+	WebhookURL string `json:"webhook_url"`
+	AlarmLevel string `json:"alarm_level"`
+}
+
+func parseRuleLines(ret string) []ruleRow {
+	lines := strings.Split(strings.TrimSpace(ret), "\n")
+	var out []ruleRow
+	for i, ln := range lines {
+		ln = strings.TrimRight(ln, "\r")
+		if i == 0 || ln == "" {
+			continue
+		}
+		fields := strings.SplitN(ln, "\t", 9)
+		for len(fields) < 9 {
+			fields = append(fields, "")
+		}
+		out = append(out, ruleRow{
+			RuleID:     fields[0],
+			Name:       fields[1],
+			DeviceID:   fields[2],
+			Kind:       fields[3],
+			KeyName:    fields[4],
+			Op:         fields[5],
+			Value:      fields[6],
+			WebhookURL: fields[7],
+			AlarmLevel: fields[8],
+		})
+	}
+	return out
+}
+
+func ruleMatches(payload map[string]any, keyName, op, value string) bool {
+	raw, ok := payload[keyName]
+	if !ok {
+		return false
+	}
+	// Try numeric comparison first
+	var numVal float64
+	var numRule float64
+	numValOK := false
+	switch v := raw.(type) {
+	case float64:
+		numVal = v
+		numValOK = true
+	case int:
+		numVal = float64(v)
+		numValOK = true
+	case int64:
+		numVal = float64(v)
+		numValOK = true
+	}
+	if _, err := fmt.Sscanf(value, "%f", &numRule); err == nil && numValOK {
+		switch op {
+		case "gt":
+			return numVal > numRule
+		case "gte":
+			return numVal >= numRule
+		case "lt":
+			return numVal < numRule
+		case "lte":
+			return numVal <= numRule
+		case "eq":
+			return numVal == numRule
+		case "ne":
+			return numVal != numRule
+		}
+	}
+	// String comparison
+	strVal := fmt.Sprint(raw)
+	switch op {
+	case "eq":
+		return strVal == value
+	case "ne":
+		return strVal != value
+	case "gt", "gte", "lt", "lte":
+		return false
+	default:
+		return false
+	}
+}
+
+func (g *gateway) evaluateRulesAndWebhooks(ctx context.Context, device, kind string, tsSec int64, payload []byte) {
+	resp, err := g.yate.call(ctx, "iot.rule.list", map[string]string{
+		"device_id": device,
+		"kind":      kind,
+	})
+	if err != nil || resp.Params["error"] != "" || resp.Ret == "error" {
+		return
+	}
+	rules := parseRuleLines(resp.Ret)
+	if len(rules) == 0 {
+		return
+	}
+	var payloadMap map[string]any
+	_ = json.Unmarshal(payload, &payloadMap)
+	if payloadMap == nil {
+		payloadMap = make(map[string]any)
+	}
+	payloadStr := string(payload)
+	if len(payloadStr) > 8192 {
+		payloadStr = payloadStr[:8192]
+	}
+	for _, r := range rules {
+		if !ruleMatches(payloadMap, r.KeyName, r.Op, r.Value) {
+			continue
+		}
+		level := r.AlarmLevel
+		if level == "" {
+			level = "warning"
+		}
+		_, _ = g.yate.call(ctx, "iot.alarm.create", map[string]string{
+			"device_id":       device,
+			"rule_id":         r.RuleID,
+			"level":           level,
+			"payload_snapshot": payloadStr,
+		})
+		if r.WebhookURL != "" {
+			body := map[string]any{
+				"device":     device,
+				"rule_id":    r.RuleID,
+				"kind":       kind,
+				"ts":         tsSec,
+				"level":      level,
+				"payload":    payloadMap,
+				"alarm_level": level,
+			}
+			b, _ := json.Marshal(body)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.WebhookURL, bytes.NewReader(b))
+			if err != nil {
+				continue
+			}
+			req.Header.Set("Content-Type", "application/json")
+			client := &http.Client{Timeout: 5 * time.Second}
+			_, _ = client.Do(req)
+		}
+	}
 }
 
 // ---- MQTT hook ----
@@ -530,29 +807,269 @@ func (g *gateway) httpHandler() http.Handler {
 	})
 
 	mux.HandleFunc("/api/v1/devices/", func(w http.ResponseWriter, r *http.Request) {
-		device := strings.TrimPrefix(r.URL.Path, "/api/v1/devices/")
-		device = strings.Trim(device, "/")
-		if device == "" {
+		pathAfter := strings.TrimPrefix(r.URL.Path, "/api/v1/devices/")
+		pathAfter = strings.Trim(pathAfter, "/")
+		parts := strings.SplitN(pathAfter, "/", 2)
+		deviceID := parts[0]
+		subPath := ""
+		if len(parts) > 1 {
+			subPath = parts[1]
+		}
+		if deviceID == "" {
 			http.NotFound(w, r)
 			return
 		}
-		switch r.Method {
-		case http.MethodGet:
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+
+		// GET/POST /api/v1/devices/{id}/telemetry — query events
+		if subPath == "telemetry" && r.Method == http.MethodGet {
+			params := map[string]string{"device": deviceID}
+			if v := r.URL.Query().Get("from"); v != "" {
+				var n int64
+				if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 1e12 {
+					n /= 1000 // milliseconds -> seconds
+				}
+				params["from_ts"] = fmt.Sprintf("%d", n)
+			}
+			if v := r.URL.Query().Get("to"); v != "" {
+				var n int64
+				if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 1e12 {
+					n /= 1000
+				}
+				params["to_ts"] = fmt.Sprintf("%d", n)
+			}
+			if v := r.URL.Query().Get("kind"); v != "" {
+				params["kind"] = v
+			}
+			if v := r.URL.Query().Get("limit"); v != "" {
+				params["limit"] = v
+			}
+			if v := r.URL.Query().Get("offset"); v != "" {
+				params["offset"] = v
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.device.get", map[string]string{"device": device})
+			resp, err := g.yate.call(ctx, "iot.event.query", params)
 			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "not found", http.StatusNotFound)
+				http.Error(w, "query failed", http.StatusBadGateway)
 				return
 			}
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			_, _ = w.Write([]byte(resp.Ret))
-		case http.MethodDelete:
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			format := r.URL.Query().Get("format")
+			if format == "csv" {
+				w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+				_, _ = w.Write([]byte(resp.Ret))
+				return
+			}
+			events := parseEventLines(resp.Ret)
+			totalStr := resp.Params["total"]
+			total := 0
+			if totalStr != "" {
+				fmt.Sscanf(totalStr, "%d", &total)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "data": events})
+			return
+		}
+
+		// GET /api/v1/devices/{id}/telemetry/latest — latest snapshot
+		if subPath == "telemetry/latest" && r.Method == http.MethodGet {
+			params := map[string]string{"device": deviceID}
+			if v := r.URL.Query().Get("kind"); v != "" {
+				params["kind"] = v
+			}
+			if v := r.URL.Query().Get("limit"); v != "" {
+				params["limit"] = v
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.device.delete", map[string]string{"device": device})
+			resp, err := g.yate.call(ctx, "iot.event.latest", params)
+			if err != nil || resp.Params["error"] != "" {
+				http.Error(w, "query failed", http.StatusBadGateway)
+				return
+			}
+			events := parseEventLines(resp.Ret)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": events})
+			return
+		}
+
+		// GET /api/v1/devices/{id}/commands — device pull pending commands
+		if subPath == "commands" && r.Method == http.MethodGet {
+			token := r.Header.Get("X-Token")
+			if token == "" {
+				token = r.URL.Query().Get("token")
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			ok, errMsg := g.yateAuth(ctx, deviceID, token, "http", r.RemoteAddr)
+			if !ok {
+				http.Error(w, errMsg, http.StatusUnauthorized)
+				return
+			}
+			params := map[string]string{"device": deviceID, "status": "pending"}
+			if v := r.URL.Query().Get("limit"); v != "" {
+				params["limit"] = v
+			}
+			resp, err := g.yate.call(ctx, "iot.command.list", params)
 			if err != nil || resp.Params["error"] != "" {
 				http.Error(w, "yate error", http.StatusBadGateway)
+				return
+			}
+			commands := parseCommandLines(resp.Ret)
+			for _, c := range commands {
+				_, _ = g.yate.call(ctx, "iot.command.mark_sent", map[string]string{"command_id": c.CommandID})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": commands})
+			return
+		}
+
+		// POST /api/v1/devices/{id}/command — platform send one command (then downlink)
+		if (subPath == "command" || subPath == "commands") && r.Method == http.MethodPost {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 256*1024))
+			if len(bytes.TrimSpace(body)) == 0 {
+				body = []byte("{}")
+			}
+			payload := string(body)
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			resp, err := g.yate.call(ctx, "iot.command.send", map[string]string{
+				"device":  deviceID,
+				"payload": payload,
+			})
+			if err != nil || resp.Params["error"] != "" {
+				http.Error(w, "yate error", http.StatusBadGateway)
+				return
+			}
+			commandID := resp.Ret
+			if commandID == "" {
+				commandID = resp.Params["command_id"]
+			}
+			if g.mqttServer != nil {
+				topic := "iot/" + deviceID + "/cmd"
+				_ = g.mqttServer.Publish(topic, body, false, 0)
+				_, _ = g.yate.call(ctx, "iot.command.mark_sent", map[string]string{"command_id": commandID})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"command_id": commandID, "result": "ok"})
+			return
+		}
+
+		// GET /api/v1/devices/{id}/alarms — list alarms for device
+		if subPath == "alarms" && r.Method == http.MethodGet {
+			params := map[string]string{"device_id": deviceID}
+			if v := r.URL.Query().Get("active_only"); v != "" && (v == "1" || strings.EqualFold(v, "true")) {
+				params["active_only"] = "true"
+			}
+			if v := r.URL.Query().Get("limit"); v != "" {
+				params["limit"] = v
+			}
+			if v := r.URL.Query().Get("offset"); v != "" {
+				params["offset"] = v
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
+			resp, err := g.yate.call(ctx, "iot.alarm.list", params)
+			if err != nil || resp.Params["error"] != "" {
+				http.Error(w, "yate error", http.StatusBadGateway)
+				return
+			}
+			alarms := parseAlarmLines(resp.Ret)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": alarms})
+			return
+		}
+
+		// GET/DELETE /api/v1/devices/{id} — device get/delete (no subpath)
+		if subPath == "" {
+			switch r.Method {
+			case http.MethodGet:
+				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				defer cancel()
+				resp, err := g.yate.call(ctx, "iot.device.get", map[string]string{"device": deviceID})
+				if err != nil || resp.Params["error"] != "" {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = w.Write([]byte(resp.Ret))
+				return
+			case http.MethodDelete:
+				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+				defer cancel()
+				resp, err := g.yate.call(ctx, "iot.device.delete", map[string]string{"device": deviceID})
+				if err != nil || resp.Params["error"] != "" {
+					http.Error(w, "yate error", http.StatusBadGateway)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
+				return
+			}
+		}
+
+		http.NotFound(w, r)
+	})
+
+	// Rules: list (by device_id + kind), create, delete
+	mux.HandleFunc("/api/v1/rules", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			deviceID := r.URL.Query().Get("device_id")
+			kind := r.URL.Query().Get("kind")
+			if deviceID == "" || kind == "" {
+				http.Error(w, "device_id and kind required", http.StatusBadRequest)
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
+			resp, err := g.yate.call(ctx, "iot.rule.list", map[string]string{"device_id": deviceID, "kind": kind})
+			if err != nil || resp.Params["error"] != "" {
+				http.Error(w, "yate error", http.StatusBadGateway)
+				return
+			}
+			rules := parseRuleLines(resp.Ret)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": rules})
+		case http.MethodPost:
+			var req struct {
+				RuleID     string `json:"rule_id"`
+				Name       string `json:"name"`
+				DeviceID   string `json:"device_id"`
+				Kind       string `json:"kind"`
+				KeyName    string `json:"key_name"`
+				Op         string `json:"op"`
+				Value      string `json:"value"`
+				WebhookURL string `json:"webhook_url"`
+				AlarmLevel string `json:"alarm_level"`
+				Enabled    *bool  `json:"enabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+			if req.RuleID == "" || req.DeviceID == "" || req.Kind == "" || req.KeyName == "" || req.Op == "" {
+				http.Error(w, "rule_id, device_id, kind, key_name, op required", http.StatusBadRequest)
+				return
+			}
+			params := map[string]string{
+				"rule_id": req.RuleID, "device_id": req.DeviceID, "kind": req.Kind,
+				"key_name": req.KeyName, "op": req.Op, "value": req.Value,
+				"webhook_url": req.WebhookURL, "alarm_level": req.AlarmLevel,
+			}
+			if req.Name != "" {
+				params["name"] = req.Name
+			}
+			if req.AlarmLevel != "" {
+				params["alarm_level"] = req.AlarmLevel
+			}
+			if req.Enabled != nil && !*req.Enabled {
+				params["enabled"] = "false"
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			resp, err := g.yate.call(ctx, "iot.rule.create", params)
+			if err != nil || resp.Params["error"] != "" {
+				http.Error(w, resp.Params["error"], http.StatusBadGateway)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -560,6 +1077,56 @@ func (g *gateway) httpHandler() http.Handler {
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	})
+	mux.HandleFunc("/api/v1/rules/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ruleID := strings.TrimPrefix(r.URL.Path, "/api/v1/rules/")
+		ruleID = strings.Trim(ruleID, "/")
+		if ruleID == "" {
+			http.NotFound(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		resp, err := g.yate.call(ctx, "iot.rule.delete", map[string]string{"rule_id": ruleID})
+		if err != nil || resp.Params["error"] != "" {
+			http.Error(w, "yate error", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
+	})
+
+	// Alarm ack: POST /api/v1/alarms/{id}/ack
+	mux.HandleFunc("/api/v1/alarms/", func(w http.ResponseWriter, r *http.Request) {
+		pathAfter := strings.TrimPrefix(r.URL.Path, "/api/v1/alarms/")
+		pathAfter = strings.Trim(pathAfter, "/")
+		parts := strings.SplitN(pathAfter, "/", 2)
+		alarmID := parts[0]
+		suffix := ""
+		if len(parts) > 1 {
+			suffix = parts[1]
+		}
+		if alarmID == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if suffix == "ack" && r.Method == http.MethodPost {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			resp, err := g.yate.call(ctx, "iot.alarm.ack", map[string]string{"alarm_id": alarmID})
+			if err != nil || resp.Params["error"] != "" {
+				http.Error(w, "yate error", http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
+			return
+		}
+		http.NotFound(w, r)
 	})
 
 	// Telemetry ingestion

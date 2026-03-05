@@ -13,6 +13,12 @@ allow_unauth=false
 default_list_limit=10000
 ; max_list_limit: int: Maximum allowed limit per list request
 max_list_limit=50000
+; default_event_limit / max_event_limit: for iot.event.query pagination
+default_event_limit=1000
+max_event_limit=10000
+; default_alarm_limit / max_alarm_limit: for iot.alarm.list pagination
+default_alarm_limit=500
+max_alarm_limit=5000
 
 [database]
 ; account: string: Database account name (provided by sqlitedb/mysqldb/pgsqldb module)
@@ -33,4 +39,20 @@ auto_create_tables=true
 ; insert_event=...
 ; list_devices=...   (must include LIMIT ${limit} OFFSET ${offset} for pagination)
 ; list_devices_count=...   (e.g. SELECT COUNT(*) FROM iot_devices;)
+; list_events=...   (WHERE device_id, from_ts, to_ts, kind_cond, LIMIT/OFFSET)
+; list_events_count=...
+; select_latest=... (device_id, kind_cond, LIMIT)
+; create_commands=...   (iot_commands table)
+; insert_command=...   (command_id, device, payload, status, now)
+; list_commands=...   (device_id, status, limit)
+; mark_command_sent=...  (command_id, now)
+; ack_command=...    (command_id, ack_payload, now)
+; create_rules=...   (iot_rules table)
+; create_alarms=...  (iot_alarms table)
+; insert_rule=...    (rule_id, name, device_id, kind, key_name, op, value, webhook_url, alarm_level, enabled)
+; list_rules=...     (device_id, kind) — returns enabled rules for device or device_id='*'
+; delete_rule=...
+; insert_alarm=...   (device_id, rule_id, start_ts, level, payload_snapshot, created_ts)
+; list_alarms=...    (device_id, active_filter, limit, offset)
+; ack_alarm=...      (alarm_id, now)
 

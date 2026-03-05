@@ -2,6 +2,8 @@
 
 这个网关进程负责把多协议设备上行统一转成 Yate `extmodule` 协议消息，并调用 Yate 内部的 `iotdev` 模块完成鉴权与入库。
 
+**集群部署**：可多节点部署，需使用共享 MySQL/PostgreSQL；详见 [docs/iot-cluster.md](../docs/iot-cluster.md)。
+
 ### 运行前提
 
 - **Yate 已编译/运行**，并加载：
@@ -86,4 +88,94 @@ mosquitto_pub -h 127.0.0.1 -p 1883 -u d1 -P t1 -t "iot/d1/telemetry" -m '{"temp"
 ```bash
 coap-client -m post "coap://127.0.0.1:5683/api/v1/d1/telemetry?token=t1" -e '{"temp":22}'
 ```
+
+### 遥测/事件查询（高优先级）
+
+- **按设备、时间、类型分页查询**
+
+```bash
+# 查询设备 d1 的遥测，时间范围、类型、分页
+curl -sS "http://127.0.0.1:8088/api/v1/devices/d1/telemetry?from=1609459200&to=1640995200&kind=telemetry&limit=100&offset=0"
+# 导出 CSV
+curl -sS "http://127.0.0.1:8088/api/v1/devices/d1/telemetry?from=1609459200&limit=1000&format=csv"
+```
+查询参数：`from`、`to` 为 Unix 秒（或毫秒，自动识别）；`kind` 可选 telemetry/attributes/heartbeat；`limit`、`offset` 分页。响应 JSON：`{"total": N, "data": [{"id","device_id","ts","kind","proto","payload"}, ...]}`。
+
+- **最新值快照**
+
+```bash
+curl -sS "http://127.0.0.1:8088/api/v1/devices/d1/telemetry/latest"
+# 仅某类型最新一条
+curl -sS "http://127.0.0.1:8088/api/v1/devices/d1/telemetry/latest?kind=telemetry&limit=1"
+```
+
+### 下行命令（高优先级）
+
+- **平台侧下发一条命令**（写入 Yate 后经 MQTT 推送到设备订阅的 `iot/{device}/cmd`）
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8088/api/v1/devices/d1/command" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"reboot","delay":5}'
+# 响应：{"command_id":"...", "result":"ok"}
+```
+
+- **设备拉取待执行命令**（HTTP 轮询，需设备 token 鉴权；拉取后自动标记为已发送）
+
+```bash
+curl -sS "http://127.0.0.1:8088/api/v1/devices/d1/commands?token=t1"
+# 或 Header: X-Token: t1
+# 响应：{"data":[{"command_id","device_id","payload","status","created_ts"}, ...]}
+```
+
+设备确认执行后可调用 Yate 的 `iot.command.ack`（或后续扩展 HTTP 确认接口）更新命令状态为已确认。
+
+### 规则引擎与告警（中高优先级）
+
+- **规则**：按设备/类型配置阈值条件，遥测入库后自动评估；命中则写告警并可选触发 Webhook。
+
+- **创建规则**（`device_id='*'` 表示所有设备）：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8088/api/v1/rules" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rule_id": "temp_high",
+    "name": "温度过高",
+    "device_id": "*",
+    "kind": "telemetry",
+    "key_name": "temp",
+    "op": "gt",
+    "value": "40",
+    "webhook_url": "https://your-server.com/webhook",
+    "alarm_level": "warning"
+  }'
+```
+
+- **列出规则**（按设备 + kind 查询）：
+
+```bash
+curl -sS "http://127.0.0.1:8088/api/v1/rules?device_id=d1&kind=telemetry"
+```
+
+- **删除规则**：
+
+```bash
+curl -sS -X DELETE "http://127.0.0.1:8088/api/v1/rules/temp_high"
+```
+
+- **告警列表**（某设备）：
+
+```bash
+curl -sS "http://127.0.0.1:8088/api/v1/devices/d1/alarms"
+# 仅未恢复：?active_only=true
+```
+
+- **确认告警**：
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8088/api/v1/alarms/1/ack"
+```
+
+- **条件运算符**：`gt` / `gte` / `lt` / `lte` / `eq` / `ne`；`key_name` 为遥测 JSON 的顶层 key（如 `temp`）。命中后写入 `iot_alarms` 并可选对 `webhook_url` 发起 POST，body 为 JSON：`device`、`rule_id`、`kind`、`ts`、`level`、`payload`。
 
