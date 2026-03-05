@@ -1,0 +1,11 @@
+; sqlitedb.conf - sample account for IoT tables
+;
+; This file is a snippet: copy the [iot] section into your sqlitedb.conf
+
+[iot]
+; SQLite database path. You can use ${configpath} to keep it next to configs.
+database=${configpath}/iot.db
+; Optional: sqlite timeout/retry tuning
+timeout=2000
+retry=5
+

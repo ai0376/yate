@@ -1,0 +1,36 @@
+; iotdev.conf
+; IoT Device Core module configuration sample
+
+[general]
+; max_payload: int: Truncate payload strings to this many bytes before storing
+max_payload=8192
+
+; allow_unauth: bool: If true, accepts uplink without token/authed=true
+; Strongly recommended to keep false in production.
+allow_unauth=false
+
+; default_list_limit: int: Default page size for iot.device.list when limit not specified (e.g. 10万 scale)
+default_list_limit=10000
+; max_list_limit: int: Maximum allowed limit per list request
+max_list_limit=50000
+
+[database]
+; account: string: Database account name (provided by sqlitedb/mysqldb/pgsqldb module)
+account=iot
+
+; auto_create_tables: bool: Create tables on startup (best-effort)
+auto_create_tables=true
+
+; You can override SQL templates below.
+; Note: all ${...} parameters are replaced by the module before sending the query.
+;
+; create_devices=...
+; create_events=...
+; insert_device=...
+; delete_device=...
+; select_device=...
+; update_last_seen=...
+; insert_event=...
+; list_devices=...   (must include LIMIT ${limit} OFFSET ${offset} for pagination)
+; list_devices_count=...   (e.g. SELECT COUNT(*) FROM iot_devices;)
+

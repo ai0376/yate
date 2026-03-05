@@ -1,0 +1,16 @@
+; extmodule.conf - sample additions for an IoT protocol gateway connection
+;
+; This file is a snippet: copy relevant sections into your extmodule.conf
+
+[listener iotgw]
+; Create a TCP listener for a gateway process to connect.
+type=tcp
+addr=127.0.0.1
+port=5040
+; Do NOT set role here - the gateway will send %%>connect:global
+
+[execute]
+; Start an external gateway process at Yate startup.
+; Replace the path with your built gateway binary.
+;/usr/local/bin/yate-iot-gateway=--yate=127.0.0.1:5040
+
