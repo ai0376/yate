@@ -26,7 +26,7 @@ function PrivateRoute({ children, ...rest }) {
 
   if (checking) {
     return (
-      <div style={{ padding: 48, textAlign: 'center' }}>
+      <div className="app-loading">
         校验登录中…
       </div>
     );

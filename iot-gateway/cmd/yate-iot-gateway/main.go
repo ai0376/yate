@@ -890,9 +890,14 @@ func (g *gateway) ginDevicesCreate(c *gin.Context, keyID, _ string) {
 		"token":  req.Token,
 		"name":   req.Name,
 	})
-	if err != nil || resp.Params["error"] != "" {
+	if err != nil {
 		g.auditLog(c.Request.Context(), keyID, "device.create", req.Device, "error", "")
-		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error: " + err.Error()})
+		return
+	}
+	if resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "device.create", req.Device, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": resp.Params["error"]})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"result": resp.Ret})
