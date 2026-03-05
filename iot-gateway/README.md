@@ -1,6 +1,6 @@
 ## yate-iot-gateway（MQTT/CoAP/HTTP → Yate）
 
-这个网关进程负责把多协议设备上行统一转成 Yate `extmodule` 协议消息，并调用 Yate 内部的 `iotdev` 模块完成鉴权与入库。
+这个网关进程负责把多协议设备上行统一转成 Yate `extmodule` 协议消息，并调用 Yate 内部的 `iotdev` 模块完成鉴权与入库。**HTTP 接口**使用 [Gin](https://github.com/gin-gonic/gin) 框架实现路由与中间件。
 
 **集群部署**：可多节点部署，需使用共享 MySQL/PostgreSQL；详见 [docs/iot-cluster.md](../docs/iot-cluster.md)。
 
@@ -30,6 +30,22 @@ go build -o yate-iot-gateway ./cmd/yate-iot-gateway
 ```bash
 ./yate-iot-gateway --yate=127.0.0.1:5040 --mqtt=:1883 --http=:8088 --coap=:5683
 ```
+
+### 安全与权限（平台 API 鉴权 + RBAC + 审计）
+
+管理类 API（设备/规则/告警/命令的 CRUD、遥测查询等）需携带 **API Key**，与设备上报使用的 device token 分离。
+
+- **鉴权方式**：请求头 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`。
+- **首次使用**：可通过环境变量设置引导 Key（仅用于首次登录或脚本），再在平台创建正式 Key：
+  - 环境变量 `API_KEY` 或 `API_KEYS`（逗号分隔）：接受为角色 **admin**，不查库。
+  - 启动参数 `--require-api-key=false` 或 `REQUIRE_API_KEY=false`：不强制 API Key（不推荐生产）。
+- **角色**：`admin`（全部）、`operator`（读写设备/规则/告警/命令）、`readonly`（仅 GET）。
+- **创建 API Key**（需 admin）：
+  - `POST /api/v1/apikeys`，body `{"key_id":"my-key","name":"ops","role":"operator"}`，响应中返回 **api_key**（仅此一次，请妥善保存）。
+- **列出/删除 Key**：`GET /api/v1/apikeys`、`DELETE /api/v1/apikeys/{key_id}`（删除需 admin）。
+- **审计日志**：管理操作会写入 Yate 表 `iot_audit_log`（actor_type=api_key, actor_id, action, target_id, result）。可通过 Yate 或后续扩展接口查询。
+
+设备上报（POST /api/v1/{device}/telemetry）与设备拉取命令（GET /api/v1/devices/{id}/commands）仍仅使用 **设备 token**，不需 API Key。
 
 ### 数据接入大小限制
 

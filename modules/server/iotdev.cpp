@@ -209,6 +209,51 @@ public:
     virtual bool received(Message& msg);
 };
 
+class IotApikeyValidateHandler : public MessageHandler
+{
+public:
+    inline IotApikeyValidateHandler(unsigned int prio = 100)
+	: MessageHandler("iot.apikey.validate",prio,0)
+	{ }
+    virtual bool received(Message& msg);
+};
+
+class IotApikeyCreateHandler : public MessageHandler
+{
+public:
+    inline IotApikeyCreateHandler(unsigned int prio = 100)
+	: MessageHandler("iot.apikey.create",prio,0)
+	{ }
+    virtual bool received(Message& msg);
+};
+
+class IotApikeyListHandler : public MessageHandler
+{
+public:
+    inline IotApikeyListHandler(unsigned int prio = 100)
+	: MessageHandler("iot.apikey.list",prio,0)
+	{ }
+    virtual bool received(Message& msg);
+};
+
+class IotApikeyDeleteHandler : public MessageHandler
+{
+public:
+    inline IotApikeyDeleteHandler(unsigned int prio = 100)
+	: MessageHandler("iot.apikey.delete",prio,0)
+	{ }
+    virtual bool received(Message& msg);
+};
+
+class IotAuditLogHandler : public MessageHandler
+{
+public:
+    inline IotAuditLogHandler(unsigned int prio = 100)
+	: MessageHandler("iot.audit.log",prio,0)
+	{ }
+    virtual bool received(Message& msg);
+};
+
 class IotDevModule : public Module
 {
 public:
@@ -235,6 +280,11 @@ public:
     bool handleAlarmCreate(Message& msg);
     bool handleAlarmList(Message& msg);
     bool handleAlarmAck(Message& msg);
+    bool handleApikeyValidate(Message& msg);
+    bool handleApikeyCreate(Message& msg);
+    bool handleApikeyList(Message& msg);
+    bool handleApikeyDelete(Message& msg);
+    bool handleAuditLog(Message& msg);
 
 private:
     bool dbDispatch(Message& db);
@@ -291,6 +341,15 @@ private:
     int m_defaultAlarmLimit;
     int m_maxAlarmLimit;
 
+    // API keys and audit
+    String m_sqlCreateApikeys;
+    String m_sqlCreateAuditLog;
+    String m_sqlSelectApikeyByHash;
+    String m_sqlInsertApikey;
+    String m_sqlListApikeys;
+    String m_sqlDeleteApikey;
+    String m_sqlInsertAudit;
+
     // Handlers
     IotAuthHandler* m_hAuth;
     IotUplinkHandler* m_hUplink;
@@ -310,6 +369,11 @@ private:
     IotAlarmCreateHandler* m_hAlarmCreate;
     IotAlarmListHandler* m_hAlarmList;
     IotAlarmAckHandler* m_hAlarmAck;
+    IotApikeyValidateHandler* m_hApikeyValidate;
+    IotApikeyCreateHandler* m_hApikeyCreate;
+    IotApikeyListHandler* m_hApikeyList;
+    IotApikeyDeleteHandler* m_hApikeyDelete;
+    IotAuditLogHandler* m_hAuditLog;
 };
 
 INIT_PLUGIN(IotDevModule);
@@ -348,7 +412,12 @@ IotDevModule::IotDevModule()
       m_hRuleDelete(0),
       m_hAlarmCreate(0),
       m_hAlarmList(0),
-      m_hAlarmAck(0)
+      m_hAlarmAck(0),
+      m_hApikeyValidate(0),
+      m_hApikeyCreate(0),
+      m_hApikeyList(0),
+      m_hApikeyDelete(0),
+      m_hAuditLog(0)
 {
     Output("Loaded module IoT Device Core");
 }
@@ -374,6 +443,11 @@ IotDevModule::~IotDevModule()
     TelEngine::destruct(m_hAlarmCreate);
     TelEngine::destruct(m_hAlarmList);
     TelEngine::destruct(m_hAlarmAck);
+    TelEngine::destruct(m_hApikeyValidate);
+    TelEngine::destruct(m_hApikeyCreate);
+    TelEngine::destruct(m_hApikeyList);
+    TelEngine::destruct(m_hApikeyDelete);
+    TelEngine::destruct(m_hAuditLog);
 }
 
 void IotDevModule::initialize()
@@ -517,6 +591,40 @@ void IotDevModule::initialize()
     if (m_maxAlarmLimit < m_defaultAlarmLimit)
 	m_maxAlarmLimit = m_defaultAlarmLimit;
 
+    m_sqlCreateApikeys = cfg.getValue("database","create_apikeys",
+	"CREATE TABLE IF NOT EXISTS iot_api_keys ("
+	" key_id TEXT PRIMARY KEY,"
+	" key_hash TEXT NOT NULL,"
+	" name TEXT,"
+	" role TEXT NOT NULL DEFAULT 'operator',"
+	" enabled INTEGER NOT NULL DEFAULT 1,"
+	" created_ts INTEGER NOT NULL"
+	");");
+    m_sqlCreateAuditLog = cfg.getValue("database","create_audit_log",
+	"CREATE TABLE IF NOT EXISTS iot_audit_log ("
+	" id INTEGER PRIMARY KEY AUTOINCREMENT,"
+	" actor_type TEXT NOT NULL,"
+	" actor_id TEXT NOT NULL,"
+	" action TEXT NOT NULL,"
+	" target_id TEXT,"
+	" ts INTEGER NOT NULL,"
+	" result TEXT NOT NULL,"
+	" details TEXT"
+	");"
+	"CREATE INDEX IF NOT EXISTS idx_iot_audit_ts ON iot_audit_log(ts);");
+    m_sqlSelectApikeyByHash = cfg.getValue("database","select_apikey_by_hash",
+	"SELECT key_id,name,role FROM iot_api_keys WHERE key_hash='${key_hash}' AND enabled=1 LIMIT 1;");
+    m_sqlInsertApikey = cfg.getValue("database","insert_apikey",
+	"INSERT INTO iot_api_keys(key_id,key_hash,name,role,enabled,created_ts)"
+	" VALUES('${key_id}','${key_hash}','${name}','${role}',1,${now});");
+    m_sqlListApikeys = cfg.getValue("database","list_apikeys",
+	"SELECT key_id,name,role,enabled,created_ts FROM iot_api_keys ORDER BY created_ts;");
+    m_sqlDeleteApikey = cfg.getValue("database","delete_apikey",
+	"DELETE FROM iot_api_keys WHERE key_id='${key_id}';");
+    m_sqlInsertAudit = cfg.getValue("database","insert_audit",
+	"INSERT INTO iot_audit_log(actor_type,actor_id,action,target_id,ts,result,details)"
+	" VALUES('${actor_type}','${actor_id}','${action}','${target_id}',${ts},'${result}','${details}');");
+
     if (m_autoCreateTables)
 	dbInit();
 
@@ -538,6 +646,11 @@ void IotDevModule::initialize()
     m_hAlarmCreate = new IotAlarmCreateHandler();
     m_hAlarmList = new IotAlarmListHandler();
     m_hAlarmAck = new IotAlarmAckHandler();
+    m_hApikeyValidate = new IotApikeyValidateHandler();
+    m_hApikeyCreate = new IotApikeyCreateHandler();
+    m_hApikeyList = new IotApikeyListHandler();
+    m_hApikeyDelete = new IotApikeyDeleteHandler();
+    m_hAuditLog = new IotAuditLogHandler();
 
     Engine::install(m_hAuth);
     Engine::install(m_hUplink);
@@ -557,6 +670,11 @@ void IotDevModule::initialize()
     Engine::install(m_hAlarmCreate);
     Engine::install(m_hAlarmList);
     Engine::install(m_hAlarmAck);
+    Engine::install(m_hApikeyValidate);
+    Engine::install(m_hApikeyCreate);
+    Engine::install(m_hApikeyList);
+    Engine::install(m_hApikeyDelete);
+    Engine::install(m_hAuditLog);
 }
 
 bool IotDevModule::unload()
@@ -581,6 +699,11 @@ bool IotDevModule::unload()
     Engine::uninstall(m_hAlarmCreate);
     Engine::uninstall(m_hAlarmList);
     Engine::uninstall(m_hAlarmAck);
+    Engine::uninstall(m_hApikeyValidate);
+    Engine::uninstall(m_hApikeyCreate);
+    Engine::uninstall(m_hApikeyList);
+    Engine::uninstall(m_hApikeyDelete);
+    Engine::uninstall(m_hAuditLog);
     unlock();
     return true;
 }
@@ -618,7 +741,9 @@ bool IotDevModule::dbInit()
     bool ok3 = dbExec(m_sqlCreateCommands,p,false,out);
     bool ok4 = dbExec(m_sqlCreateRules,p,false,out);
     bool ok5 = dbExec(m_sqlCreateAlarms,p,false,out);
-    return ok1 && ok2 && ok3 && ok4 && ok5;
+    bool ok6 = dbExec(m_sqlCreateApikeys,p,false,out);
+    bool ok7 = dbExec(m_sqlCreateAuditLog,p,false,out);
+    return ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7;
 }
 
 bool IotDevModule::dbGetDevice(const String& deviceId, String& tokenHash, String& name, int& enabled, int64_t& lastSeen)
@@ -1336,6 +1461,149 @@ bool IotDevModule::handleAlarmAck(Message& msg)
     return true;
 }
 
+bool IotDevModule::handleApikeyValidate(Message& msg)
+{
+    const String* key = msg.getParam("api_key");
+    if (TelEngine::null(key) || key->null()) {
+	msg.setParam("error","missing api_key");
+	return true;
+    }
+    SHA256 sha(*key);
+    String keyHash = sha.hexDigest();
+    NamedList p("");
+    p.addParam("key_hash",sqlEscape(keyHash));
+    Message db("database");
+    if (!dbExec(m_sqlSelectApikeyByHash,p,true,db) || db.getIntValue("rows") < 1) {
+	msg.setParam("error","invalid or disabled api_key");
+	msg.retValue() = "invalid";
+	return true;
+    }
+    Array* a = static_cast<Array*>(db.userObject(YATOM("Array")));
+    if (!a)
+	return true;
+    String* kid = YOBJECT(String,a->get(0,1));
+    String* nm = YOBJECT(String,a->get(1,1));
+    String* role = YOBJECT(String,a->get(2,1));
+    if (kid)
+	msg.setParam("key_id",*kid);
+    if (nm)
+	msg.setParam("name",*nm);
+    msg.setParam("role",role && *role ? role->c_str() : "operator");
+    msg.retValue() = "ok";
+    return true;
+}
+
+bool IotDevModule::handleApikeyCreate(Message& msg)
+{
+    const String* kid = msg.getParam("key_id");
+    const String* key = msg.getParam("api_key");
+    const String* name = msg.getParam("name");
+    const String* role = msg.getParam("role");
+    if (TelEngine::null(kid) || kid->null() || TelEngine::null(key) || key->null()) {
+	msg.setParam("error","missing key_id or api_key");
+	return true;
+    }
+    String roleVal = (role && *role) ? *role : "operator";
+    if (roleVal != "admin" && roleVal != "operator" && roleVal != "readonly")
+	roleVal = "operator";
+    SHA256 sha(*key);
+    String keyHash = sha.hexDigest();
+    int64_t nowSec = (int64_t)Time::secNow();
+    NamedList p("");
+    p.addParam("key_id",sqlEscape(*kid));
+    p.addParam("key_hash",sqlEscape(keyHash));
+    p.addParam("name",sqlEscape(name ? *name : ""));
+    p.addParam("role",sqlEscape(roleVal));
+    p.addParam("now",String(nowSec));
+    Message out("database");
+    if (!dbExec(m_sqlInsertApikey,p,false,out)) {
+	msg.setParam("error","db insert failed");
+	msg.retValue() = "error";
+	return true;
+    }
+    msg.setParam("key_id",*kid);
+    msg.retValue() = "created";
+    return true;
+}
+
+bool IotDevModule::handleApikeyList(Message& msg)
+{
+    NamedList p("");
+    Message db("database");
+    if (!dbExec(m_sqlListApikeys,p,true,db)) {
+	msg.setParam("error","db query failed");
+	msg.retValue() = "error";
+	return true;
+    }
+    Array* a = static_cast<Array*>(db.userObject(YATOM("Array")));
+    if (!a || db.getIntValue("rows") < 1) {
+	msg.retValue() = "key_id\tname\trole\tenabled\tcreated_ts\r\n";
+	return true;
+    }
+    msg.retValue().clear();
+    msg.retValue() << "key_id\tname\trole\tenabled\tcreated_ts\r\n";
+    int rows = db.getIntValue("rows");
+    for (int r = 1; r <= rows; r++) {
+	String* kid = YOBJECT(String,a->get(0,r));
+	String* nm = YOBJECT(String,a->get(1,r));
+	String* role = YOBJECT(String,a->get(2,r));
+	String* en = YOBJECT(String,a->get(3,r));
+	String* ct = YOBJECT(String,a->get(4,r));
+	if (!kid)
+	    continue;
+	msg.retValue() << *kid << "\t" << (nm ? nm->c_str() : "") << "\t" << (role ? role->c_str() : "operator") << "\t"
+	    << (en ? en->c_str() : "1") << "\t" << (ct ? ct->c_str() : "0") << "\r\n";
+    }
+    return true;
+}
+
+bool IotDevModule::handleApikeyDelete(Message& msg)
+{
+    const String* kid = msg.getParam("key_id");
+    if (TelEngine::null(kid)) {
+	msg.setParam("error","missing key_id");
+	return true;
+    }
+    NamedList p("");
+    p.addParam("key_id",sqlEscape(*kid));
+    Message out("database");
+    if (!dbExec(m_sqlDeleteApikey,p,false,out)) {
+	msg.setParam("error","db delete failed");
+	msg.retValue() = "error";
+	return true;
+    }
+    msg.retValue() = "deleted";
+    return true;
+}
+
+bool IotDevModule::handleAuditLog(Message& msg)
+{
+    const String* actorType = msg.getParam("actor_type");
+    const String* actorId = msg.getParam("actor_id");
+    const String* action = msg.getParam("action");
+    const String* result = msg.getParam("result");
+    if (TelEngine::null(actorType) || TelEngine::null(actorId) || TelEngine::null(action) || TelEngine::null(result)) {
+	return true;
+    }
+    String targetId = msg.getValue("target_id");
+    String details = msg.getValue("details");
+    if (details.length() > (unsigned int)m_maxPayload)
+	details = details.substr(0,m_maxPayload);
+    int64_t nowSec = (int64_t)Time::secNow();
+    NamedList p("");
+    p.addParam("actor_type",sqlEscape(*actorType));
+    p.addParam("actor_id",sqlEscape(*actorId));
+    p.addParam("action",sqlEscape(*action));
+    p.addParam("target_id",sqlEscape(targetId));
+    p.addParam("ts",String(nowSec));
+    p.addParam("result",sqlEscape(*result));
+    p.addParam("details",sqlEscape(details));
+    Message out("database");
+    dbExec(m_sqlInsertAudit,p,false,out);
+    msg.retValue() = "ok";
+    return true;
+}
+
 bool IotAuthHandler::received(Message& msg)
 {
     return __plugin.handleAuth(msg);
@@ -1424,6 +1692,31 @@ bool IotAlarmListHandler::received(Message& msg)
 bool IotAlarmAckHandler::received(Message& msg)
 {
     return __plugin.handleAlarmAck(msg);
+}
+
+bool IotApikeyValidateHandler::received(Message& msg)
+{
+    return __plugin.handleApikeyValidate(msg);
+}
+
+bool IotApikeyCreateHandler::received(Message& msg)
+{
+    return __plugin.handleApikeyCreate(msg);
+}
+
+bool IotApikeyListHandler::received(Message& msg)
+{
+    return __plugin.handleApikeyList(msg);
+}
+
+bool IotApikeyDeleteHandler::received(Message& msg)
+{
+    return __plugin.handleApikeyDelete(msg);
+}
+
+bool IotAuditLogHandler::received(Message& msg)
+{
+    return __plugin.handleAuditLog(msg);
 }
 
 } // namespace

@@ -55,4 +55,8 @@ auto_create_tables=true
 ; insert_alarm=...   (device_id, rule_id, start_ts, level, payload_snapshot, created_ts)
 ; list_alarms=...    (device_id, active_filter, limit, offset)
 ; ack_alarm=...      (alarm_id, now)
+; create_apikeys=...   (iot_api_keys: key_id, key_hash, name, role, enabled, created_ts)
+; create_audit_log=... (iot_audit_log: actor_type, actor_id, action, target_id, ts, result, details)
+; select_apikey_by_hash=..., insert_apikey=..., list_apikeys=..., delete_apikey=...
+; insert_audit=...
 

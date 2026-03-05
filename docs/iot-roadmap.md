@@ -53,13 +53,13 @@
 | **设备分组/标签** | 按项目、区域、类型分组或打 tag | `iot_devices` 增加 `group_id` 或 `tags`（JSON/关联表）；列表/查询支持按 group/tag 过滤 |
 | **设备模板/Profile** | 设备类型、默认属性、上报规范 | 表 `iot_device_profiles`，创建设备时绑定 profile，便于规则与展示按类型区分 |
 
-### 5. 安全与权限（中）
+### 5. 安全与权限（中）✅ 已实现
 
-| 功能 | 说明 | 实现思路 |
-|------|------|----------|
-| **平台 API 鉴权** | 设备用 token；管理/控制台用 API Key 或 JWT | 管理 API（如创建设备、查数据、下发命令）走 API Key 或 OAuth2/JWT，与设备 token 分离 |
-| **RBAC** | 角色与权限（只读、运维、管理员） | 用户表 + 角色表 + 权限标识；API 中间件校验权限 |
-| **审计日志** | 谁在何时做了哪些操作 | 表 `iot_audit_log`（user/device, action, ts, result）；在创删设备、下发命令、修改配置处落库 |
+| 功能 | 说明 | 实现 |
+|------|------|------|
+| **平台 API 鉴权** | 设备用 token；管理 API 用 API Key | 管理类接口需 `X-API-Key` 或 `Authorization: Bearer`；支持环境变量 `API_KEY`/`API_KEYS` 引导；Yate 表 `iot_api_keys`，`iot.apikey.validate` |
+| **RBAC** | 角色与权限 | 角色 `admin`/`operator`/`readonly`；readonly 仅 GET；operator 可读写设备/规则/告警/命令；apikey 创建/删除仅 admin |
+| **审计日志** | 谁在何时做了哪些操作 | 表 `iot_audit_log`（actor_type, actor_id, action, target_id, ts, result, details）；网关在设备/规则/告警/命令/apikey 操作后调用 `iot.audit.log` |
 
 ### 6. 运维与可观测性（中）
 

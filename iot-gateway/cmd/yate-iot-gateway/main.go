@@ -24,6 +24,7 @@ import (
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/listeners"
 	"github.com/mochi-mqtt/server/v2/packets"
+	"github.com/gin-gonic/gin"
 	coap "github.com/plgd-dev/go-coap/v3"
 	coapmux "github.com/plgd-dev/go-coap/v3/mux"
 	"github.com/plgd-dev/go-coap/v3/message"
@@ -436,6 +437,41 @@ func parseCommandLines(ret string) []commandRow {
 	return out
 }
 
+func parseApikeyLines(ret string) []apikeyRow {
+	lines := strings.Split(strings.TrimSpace(ret), "\n")
+	var out []apikeyRow
+	for i, ln := range lines {
+		ln = strings.TrimRight(ln, "\r")
+		if i == 0 || ln == "" {
+			continue
+		}
+		fields := strings.SplitN(ln, "\t", 5)
+		for len(fields) < 5 {
+			fields = append(fields, "")
+		}
+		var createdTs int64
+		fmt.Sscanf(fields[4], "%d", &createdTs)
+		enabled := 1
+		fmt.Sscanf(fields[3], "%d", &enabled)
+		out = append(out, apikeyRow{
+			KeyID:     fields[0],
+			Name:      fields[1],
+			Role:      fields[2],
+			Enabled:   enabled,
+			CreatedTs: createdTs,
+		})
+	}
+	return out
+}
+
+type apikeyRow struct {
+	KeyID     string `json:"key_id"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	Enabled   int    `json:"enabled"`
+	CreatedTs int64  `json:"created_ts"`
+}
+
 func parseAlarmLines(ret string) []alarmRow {
 	lines := strings.Split(strings.TrimSpace(ret), "\n")
 	var out []alarmRow
@@ -719,455 +755,556 @@ func (h *yateAuthHook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Pa
 	return pk, nil
 }
 
-// ---- HTTP ----
+// ---- HTTP (Gin) ----
 func (g *gateway) httpHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+	r := gin.New()
+	r.Use(gin.Recovery())
+
+	r.GET("/healthz", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
 	})
 
-	// Device management
-	mux.HandleFunc("/api/v1/devices", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			params := map[string]string{}
-			if v := r.URL.Query().Get("limit"); v != "" {
-				params["limit"] = v
+	api := r.Group("/api/v1")
+	{
+		// Device list & create
+		api.GET("/devices", g.ginRequireMgmt("devices", g.ginDevicesList))
+		api.POST("/devices", g.ginRequireMgmt("devices", g.ginDevicesCreate))
+
+		// Device by ID: get/delete
+		api.GET("/devices/:device_id", g.ginRequireMgmt("devices", g.ginDeviceGet))
+		api.DELETE("/devices/:device_id", g.ginRequireMgmt("devices", g.ginDeviceDelete))
+
+		// Device sub-resources
+		api.GET("/devices/:device_id/telemetry", g.ginRequireMgmt("devices", g.ginDeviceTelemetry))
+		api.GET("/devices/:device_id/telemetry/latest", g.ginRequireMgmt("devices", g.ginDeviceTelemetryLatest))
+		api.GET("/devices/:device_id/commands", g.ginDeviceCommandsGet) // token auth
+		api.POST("/devices/:device_id/command", g.ginRequireMgmt("devices", g.ginDeviceCommandSend))
+		api.POST("/devices/:device_id/commands", g.ginRequireMgmt("devices", g.ginDeviceCommandSend))
+		api.GET("/devices/:device_id/alarms", g.ginRequireMgmt("devices", g.ginDeviceAlarms))
+
+		// Rules
+		api.GET("/rules", g.ginRequireMgmt("rules", g.ginRulesList))
+		api.POST("/rules", g.ginRequireMgmt("rules", g.ginRulesCreate))
+		api.DELETE("/rules/:rule_id", g.ginRequireMgmt("rules", g.ginRuleDelete))
+
+		// Alarms
+		api.POST("/alarms/:alarm_id/ack", g.ginRequireMgmt("alarms", g.ginAlarmAck))
+
+		// Auth (validate API key for frontend login)
+		api.GET("/auth/validate", g.ginAuthValidate)
+
+		// API Keys
+		api.GET("/apikeys", g.ginRequireMgmt("apikeys", g.ginApikeysList))
+		api.POST("/apikeys", g.ginRequireMgmt("apikeys", g.ginApikeysCreate))
+		api.DELETE("/apikeys/:key_id", g.ginRequireMgmt("apikeys", g.ginApikeyDelete))
+
+		// Telemetry ingestion: POST /api/v1/:device/:kind
+		api.POST("/:device/:kind", g.ginTelemetryIngest)
+	}
+	return r
+}
+
+// ginRequireMgmt wraps a gin handler with management API key auth; passes keyID and role to handler.
+func (g *gateway) ginRequireMgmt(pathHint string, h func(*gin.Context, string, string)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		keyID, role, err := g.requireManagementAuth(c.Request, c.Request.Method, pathHint)
+		if err != nil {
+			if err.Error() == "missing api key" || err.Error() == "invalid api key" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+			} else {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": err.Error()})
 			}
-			if v := r.URL.Query().Get("offset"); v != "" {
-				params["offset"] = v
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.device.list", params)
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "yate error", http.StatusBadGateway)
-				return
-			}
-			lines := strings.Split(strings.TrimSpace(resp.Ret), "\n")
-			type devRow struct {
-				DeviceID string `json:"device_id"`
-				Name     string `json:"name"`
-				Enabled  int    `json:"enabled"`
-				LastSeen int64  `json:"last_seen"`
-			}
-			var out []devRow
-			for i, ln := range lines {
-				if i == 0 {
-					continue
-				}
-				ln = strings.TrimRight(ln, "\r")
-				if ln == "" {
-					continue
-				}
-				fields := strings.Split(ln, "\t")
-				for len(fields) < 4 {
-					fields = append(fields, "")
-				}
-				enabled := 1
-				fmt.Sscanf(fields[2], "%d", &enabled)
-				var last int64
-				fmt.Sscanf(fields[3], "%d", &last)
-				out = append(out, devRow{DeviceID: fields[0], Name: fields[1], Enabled: enabled, LastSeen: last})
-			}
-			totalStr := resp.Params["total"]
-			total := 0
-			if totalStr != "" {
-				fmt.Sscanf(totalStr, "%d", &total)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "data": out})
-		case http.MethodPost:
-			var req struct {
-				Device string `json:"device"`
-				Token  string `json:"token"`
-				Name   string `json:"name"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid json", http.StatusBadRequest)
-				return
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.device.create", map[string]string{
-				"device": req.Device,
-				"token":  req.Token,
-				"name":   req.Name,
-			})
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "yate error", http.StatusBadGateway)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
+		if role == "" {
+			role = "operator"
+		}
+		h(c, keyID, role)
+	}
+}
+
+func (g *gateway) ginDevicesList(c *gin.Context, keyID, _ string) {
+	params := map[string]string{}
+	if v := c.Query("limit"); v != "" {
+		params["limit"] = v
+	}
+	if v := c.Query("offset"); v != "" {
+		params["offset"] = v
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.device.list", params)
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	lines := strings.Split(strings.TrimSpace(resp.Ret), "\n")
+	type devRow struct {
+		DeviceID string `json:"device_id"`
+		Name     string `json:"name"`
+		Enabled  int    `json:"enabled"`
+		LastSeen int64  `json:"last_seen"`
+	}
+	var out []devRow
+	for i, ln := range lines {
+		if i == 0 {
+			continue
+		}
+		ln = strings.TrimRight(ln, "\r")
+		if ln == "" {
+			continue
+		}
+		fields := strings.Split(ln, "\t")
+		for len(fields) < 4 {
+			fields = append(fields, "")
+		}
+		enabled := 1
+		fmt.Sscanf(fields[2], "%d", &enabled)
+		var last int64
+		fmt.Sscanf(fields[3], "%d", &last)
+		out = append(out, devRow{DeviceID: fields[0], Name: fields[1], Enabled: enabled, LastSeen: last})
+	}
+	totalStr := resp.Params["total"]
+	total := 0
+	if totalStr != "" {
+		fmt.Sscanf(totalStr, "%d", &total)
+	}
+	c.JSON(http.StatusOK, gin.H{"total": total, "data": out})
+	g.auditLog(c.Request.Context(), keyID, "device.list", "", "ok", "")
+}
+
+func (g *gateway) ginDevicesCreate(c *gin.Context, keyID, _ string) {
+	var req struct {
+		Device string `json:"device"`
+		Token  string `json:"token"`
+		Name   string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.device.create", map[string]string{
+		"device": req.Device,
+		"token":  req.Token,
+		"name":   req.Name,
 	})
+	if err != nil || resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "device.create", req.Device, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": resp.Ret})
+	g.auditLog(c.Request.Context(), keyID, "device.create", req.Device, "ok", "")
+}
 
-	mux.HandleFunc("/api/v1/devices/", func(w http.ResponseWriter, r *http.Request) {
-		pathAfter := strings.TrimPrefix(r.URL.Path, "/api/v1/devices/")
-		pathAfter = strings.Trim(pathAfter, "/")
-		parts := strings.SplitN(pathAfter, "/", 2)
-		deviceID := parts[0]
-		subPath := ""
-		if len(parts) > 1 {
-			subPath = parts[1]
-		}
-		if deviceID == "" {
-			http.NotFound(w, r)
-			return
-		}
+func (g *gateway) ginDeviceGet(c *gin.Context, keyID, _ string) {
+	deviceID := c.Param("device_id")
+	if deviceID == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.device.get", map[string]string{"device": deviceID})
+	if err != nil || resp.Params["error"] != "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(resp.Ret))
+	g.auditLog(c.Request.Context(), keyID, "device.get", deviceID, "ok", "")
+}
 
-		// GET/POST /api/v1/devices/{id}/telemetry — query events
-		if subPath == "telemetry" && r.Method == http.MethodGet {
-			params := map[string]string{"device": deviceID}
-			if v := r.URL.Query().Get("from"); v != "" {
-				var n int64
-				if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 1e12 {
-					n /= 1000 // milliseconds -> seconds
-				}
-				params["from_ts"] = fmt.Sprintf("%d", n)
-			}
-			if v := r.URL.Query().Get("to"); v != "" {
-				var n int64
-				if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 1e12 {
-					n /= 1000
-				}
-				params["to_ts"] = fmt.Sprintf("%d", n)
-			}
-			if v := r.URL.Query().Get("kind"); v != "" {
-				params["kind"] = v
-			}
-			if v := r.URL.Query().Get("limit"); v != "" {
-				params["limit"] = v
-			}
-			if v := r.URL.Query().Get("offset"); v != "" {
-				params["offset"] = v
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.event.query", params)
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "query failed", http.StatusBadGateway)
-				return
-			}
-			format := r.URL.Query().Get("format")
-			if format == "csv" {
-				w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-				_, _ = w.Write([]byte(resp.Ret))
-				return
-			}
-			events := parseEventLines(resp.Ret)
-			totalStr := resp.Params["total"]
-			total := 0
-			if totalStr != "" {
-				fmt.Sscanf(totalStr, "%d", &total)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"total": total, "data": events})
-			return
-		}
+func (g *gateway) ginDeviceDelete(c *gin.Context, keyID, _ string) {
+	deviceID := c.Param("device_id")
+	if deviceID == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.device.delete", map[string]string{"device": deviceID})
+	if err != nil || resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "device.delete", deviceID, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": resp.Ret})
+	g.auditLog(c.Request.Context(), keyID, "device.delete", deviceID, "ok", "")
+}
 
-		// GET /api/v1/devices/{id}/telemetry/latest — latest snapshot
-		if subPath == "telemetry/latest" && r.Method == http.MethodGet {
-			params := map[string]string{"device": deviceID}
-			if v := r.URL.Query().Get("kind"); v != "" {
-				params["kind"] = v
-			}
-			if v := r.URL.Query().Get("limit"); v != "" {
-				params["limit"] = v
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.event.latest", params)
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "query failed", http.StatusBadGateway)
-				return
-			}
-			events := parseEventLines(resp.Ret)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": events})
-			return
+func (g *gateway) ginDeviceTelemetry(c *gin.Context, keyID, _ string) {
+	deviceID := c.Param("device_id")
+	params := map[string]string{"device": deviceID}
+	if v := c.Query("from"); v != "" {
+		var n int64
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 1e12 {
+			n /= 1000
 		}
-
-		// GET /api/v1/devices/{id}/commands — device pull pending commands
-		if subPath == "commands" && r.Method == http.MethodGet {
-			token := r.Header.Get("X-Token")
-			if token == "" {
-				token = r.URL.Query().Get("token")
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			defer cancel()
-			ok, errMsg := g.yateAuth(ctx, deviceID, token, "http", r.RemoteAddr)
-			if !ok {
-				http.Error(w, errMsg, http.StatusUnauthorized)
-				return
-			}
-			params := map[string]string{"device": deviceID, "status": "pending"}
-			if v := r.URL.Query().Get("limit"); v != "" {
-				params["limit"] = v
-			}
-			resp, err := g.yate.call(ctx, "iot.command.list", params)
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "yate error", http.StatusBadGateway)
-				return
-			}
-			commands := parseCommandLines(resp.Ret)
-			for _, c := range commands {
-				_, _ = g.yate.call(ctx, "iot.command.mark_sent", map[string]string{"command_id": c.CommandID})
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": commands})
-			return
+		params["from_ts"] = fmt.Sprintf("%d", n)
+	}
+	if v := c.Query("to"); v != "" {
+		var n int64
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 1e12 {
+			n /= 1000
 		}
+		params["to_ts"] = fmt.Sprintf("%d", n)
+	}
+	if v := c.Query("kind"); v != "" {
+		params["kind"] = v
+	}
+	if v := c.Query("limit"); v != "" {
+		params["limit"] = v
+	}
+	if v := c.Query("offset"); v != "" {
+		params["offset"] = v
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.event.query", params)
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "query failed"})
+		return
+	}
+	if c.Query("format") == "csv" {
+		c.Data(http.StatusOK, "text/csv; charset=utf-8", []byte(resp.Ret))
+		return
+	}
+	events := parseEventLines(resp.Ret)
+	total := 0
+	if totalStr := resp.Params["total"]; totalStr != "" {
+		fmt.Sscanf(totalStr, "%d", &total)
+	}
+	c.JSON(http.StatusOK, gin.H{"total": total, "data": events})
+	g.auditLog(c.Request.Context(), keyID, "event.query", deviceID, "ok", "")
+}
 
-		// POST /api/v1/devices/{id}/command — platform send one command (then downlink)
-		if (subPath == "command" || subPath == "commands") && r.Method == http.MethodPost {
-			body, _ := io.ReadAll(io.LimitReader(r.Body, 256*1024))
-			if len(bytes.TrimSpace(body)) == 0 {
-				body = []byte("{}")
-			}
-			payload := string(body)
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.command.send", map[string]string{
-				"device":  deviceID,
-				"payload": payload,
-			})
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "yate error", http.StatusBadGateway)
-				return
-			}
-			commandID := resp.Ret
-			if commandID == "" {
-				commandID = resp.Params["command_id"]
-			}
-			if g.mqttServer != nil {
-				topic := "iot/" + deviceID + "/cmd"
-				_ = g.mqttServer.Publish(topic, body, false, 0)
-				_, _ = g.yate.call(ctx, "iot.command.mark_sent", map[string]string{"command_id": commandID})
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"command_id": commandID, "result": "ok"})
-			return
-		}
+func (g *gateway) ginDeviceTelemetryLatest(c *gin.Context, keyID, _ string) {
+	deviceID := c.Param("device_id")
+	params := map[string]string{"device": deviceID}
+	if v := c.Query("kind"); v != "" {
+		params["kind"] = v
+	}
+	if v := c.Query("limit"); v != "" {
+		params["limit"] = v
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.event.latest", params)
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "query failed"})
+		return
+	}
+	events := parseEventLines(resp.Ret)
+	c.JSON(http.StatusOK, gin.H{"data": events})
+	g.auditLog(c.Request.Context(), keyID, "event.latest", deviceID, "ok", "")
+}
 
-		// GET /api/v1/devices/{id}/alarms — list alarms for device
-		if subPath == "alarms" && r.Method == http.MethodGet {
-			params := map[string]string{"device_id": deviceID}
-			if v := r.URL.Query().Get("active_only"); v != "" && (v == "1" || strings.EqualFold(v, "true")) {
-				params["active_only"] = "true"
-			}
-			if v := r.URL.Query().Get("limit"); v != "" {
-				params["limit"] = v
-			}
-			if v := r.URL.Query().Get("offset"); v != "" {
-				params["offset"] = v
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.alarm.list", params)
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "yate error", http.StatusBadGateway)
-				return
-			}
-			alarms := parseAlarmLines(resp.Ret)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": alarms})
-			return
-		}
+func (g *gateway) ginDeviceCommandsGet(c *gin.Context) {
+	deviceID := c.Param("device_id")
+	token := c.GetHeader("X-Token")
+	if token == "" {
+		token = c.Query("token")
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	ok, errMsg := g.yateAuth(ctx, deviceID, token, "http", c.ClientIP())
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": errMsg})
+		return
+	}
+	params := map[string]string{"device": deviceID, "status": "pending"}
+	if v := c.Query("limit"); v != "" {
+		params["limit"] = v
+	}
+	resp, err := g.yate.call(ctx, "iot.command.list", params)
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	commands := parseCommandLines(resp.Ret)
+	for _, cmd := range commands {
+		_, _ = g.yate.call(ctx, "iot.command.mark_sent", map[string]string{"command_id": cmd.CommandID})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": commands})
+}
 
-		// GET/DELETE /api/v1/devices/{id} — device get/delete (no subpath)
-		if subPath == "" {
-			switch r.Method {
-			case http.MethodGet:
-				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-				defer cancel()
-				resp, err := g.yate.call(ctx, "iot.device.get", map[string]string{"device": deviceID})
-				if err != nil || resp.Params["error"] != "" {
-					http.Error(w, "not found", http.StatusNotFound)
-					return
-				}
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				_, _ = w.Write([]byte(resp.Ret))
-				return
-			case http.MethodDelete:
-				ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-				defer cancel()
-				resp, err := g.yate.call(ctx, "iot.device.delete", map[string]string{"device": deviceID})
-				if err != nil || resp.Params["error"] != "" {
-					http.Error(w, "yate error", http.StatusBadGateway)
-					return
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
-				return
-			}
-		}
-
-		http.NotFound(w, r)
+func (g *gateway) ginDeviceCommandSend(c *gin.Context, keyID, _ string) {
+	deviceID := c.Param("device_id")
+	body, _ := io.ReadAll(io.LimitReader(c.Request.Body, 256*1024))
+	if len(bytes.TrimSpace(body)) == 0 {
+		body = []byte("{}")
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.command.send", map[string]string{
+		"device":  deviceID,
+		"payload": string(body),
 	})
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	commandID := resp.Ret
+	if commandID == "" {
+		commandID = resp.Params["command_id"]
+	}
+	if g.mqttServer != nil {
+		_ = g.mqttServer.Publish("iot/"+deviceID+"/cmd", body, false, 0)
+		_, _ = g.yate.call(ctx, "iot.command.mark_sent", map[string]string{"command_id": commandID})
+	}
+	c.JSON(http.StatusOK, gin.H{"command_id": commandID, "result": "ok"})
+	g.auditLog(c.Request.Context(), keyID, "command.send", deviceID, "ok", "")
+}
 
-	// Rules: list (by device_id + kind), create, delete
-	mux.HandleFunc("/api/v1/rules", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			deviceID := r.URL.Query().Get("device_id")
-			kind := r.URL.Query().Get("kind")
-			if deviceID == "" || kind == "" {
-				http.Error(w, "device_id and kind required", http.StatusBadRequest)
-				return
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.rule.list", map[string]string{"device_id": deviceID, "kind": kind})
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "yate error", http.StatusBadGateway)
-				return
-			}
-			rules := parseRuleLines(resp.Ret)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": rules})
-		case http.MethodPost:
-			var req struct {
-				RuleID     string `json:"rule_id"`
-				Name       string `json:"name"`
-				DeviceID   string `json:"device_id"`
-				Kind       string `json:"kind"`
-				KeyName    string `json:"key_name"`
-				Op         string `json:"op"`
-				Value      string `json:"value"`
-				WebhookURL string `json:"webhook_url"`
-				AlarmLevel string `json:"alarm_level"`
-				Enabled    *bool  `json:"enabled"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "invalid json", http.StatusBadRequest)
-				return
-			}
-			if req.RuleID == "" || req.DeviceID == "" || req.Kind == "" || req.KeyName == "" || req.Op == "" {
-				http.Error(w, "rule_id, device_id, kind, key_name, op required", http.StatusBadRequest)
-				return
-			}
-			params := map[string]string{
-				"rule_id": req.RuleID, "device_id": req.DeviceID, "kind": req.Kind,
-				"key_name": req.KeyName, "op": req.Op, "value": req.Value,
-				"webhook_url": req.WebhookURL, "alarm_level": req.AlarmLevel,
-			}
-			if req.Name != "" {
-				params["name"] = req.Name
-			}
-			if req.AlarmLevel != "" {
-				params["alarm_level"] = req.AlarmLevel
-			}
-			if req.Enabled != nil && !*req.Enabled {
-				params["enabled"] = "false"
-			}
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.rule.create", params)
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, resp.Params["error"], http.StatusBadGateway)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	mux.HandleFunc("/api/v1/rules/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		ruleID := strings.TrimPrefix(r.URL.Path, "/api/v1/rules/")
-		ruleID = strings.Trim(ruleID, "/")
-		if ruleID == "" {
-			http.NotFound(w, r)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		resp, err := g.yate.call(ctx, "iot.rule.delete", map[string]string{"rule_id": ruleID})
-		if err != nil || resp.Params["error"] != "" {
-			http.Error(w, "yate error", http.StatusBadGateway)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
-	})
+func (g *gateway) ginDeviceAlarms(c *gin.Context, keyID, _ string) {
+	deviceID := c.Param("device_id")
+	params := map[string]string{"device_id": deviceID}
+	if v := c.Query("active_only"); v != "" && (v == "1" || strings.EqualFold(v, "true")) {
+		params["active_only"] = "true"
+	}
+	if v := c.Query("limit"); v != "" {
+		params["limit"] = v
+	}
+	if v := c.Query("offset"); v != "" {
+		params["offset"] = v
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.alarm.list", params)
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	alarms := parseAlarmLines(resp.Ret)
+	c.JSON(http.StatusOK, gin.H{"data": alarms})
+	g.auditLog(c.Request.Context(), keyID, "alarm.list", deviceID, "ok", "")
+}
 
-	// Alarm ack: POST /api/v1/alarms/{id}/ack
-	mux.HandleFunc("/api/v1/alarms/", func(w http.ResponseWriter, r *http.Request) {
-		pathAfter := strings.TrimPrefix(r.URL.Path, "/api/v1/alarms/")
-		pathAfter = strings.Trim(pathAfter, "/")
-		parts := strings.SplitN(pathAfter, "/", 2)
-		alarmID := parts[0]
-		suffix := ""
-		if len(parts) > 1 {
-			suffix = parts[1]
-		}
-		if alarmID == "" {
-			http.NotFound(w, r)
-			return
-		}
-		if suffix == "ack" && r.Method == http.MethodPost {
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			defer cancel()
-			resp, err := g.yate.call(ctx, "iot.alarm.ack", map[string]string{"alarm_id": alarmID})
-			if err != nil || resp.Params["error"] != "" {
-				http.Error(w, "yate error", http.StatusBadGateway)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"result": resp.Ret})
-			return
-		}
-		http.NotFound(w, r)
-	})
+func (g *gateway) ginRulesList(c *gin.Context, keyID, _ string) {
+	deviceID := c.Query("device_id")
+	kind := c.Query("kind")
+	if deviceID == "" || kind == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "device_id and kind required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.rule.list", map[string]string{"device_id": deviceID, "kind": kind})
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	rules := parseRuleLines(resp.Ret)
+	c.JSON(http.StatusOK, gin.H{"data": rules})
+	g.auditLog(c.Request.Context(), keyID, "rule.list", "", "ok", "")
+}
 
-	// Telemetry ingestion
-	mux.HandleFunc("/api/v1/", func(w http.ResponseWriter, r *http.Request) {
-		// POST /api/v1/{device}/telemetry
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		path := strings.TrimPrefix(r.URL.Path, "/api/v1/")
-		parts := strings.Split(strings.Trim(path, "/"), "/")
-		if len(parts) != 2 {
-			http.NotFound(w, r)
-			return
-		}
-		device := parts[0]
-		kind := parts[1]
-		if kind != "telemetry" && kind != "attributes" && kind != "heartbeat" {
-			http.NotFound(w, r)
-			return
-		}
-		token := r.Header.Get("X-Token")
-		if token == "" {
-			token = r.URL.Query().Get("token")
-		}
-		body, _ := io.ReadAll(io.LimitReader(r.Body, maxHTTPBodySize))
-		if len(bytes.TrimSpace(body)) == 0 {
-			body = []byte("{}")
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel()
-		ok, _ := g.yateUplink(ctx, device, token, "http", kind, time.Now().Unix(), body, false)
-		if !ok {
-			http.Error(w, "unauthorized or error", http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte("ok"))
-	})
+func (g *gateway) ginRulesCreate(c *gin.Context, keyID, _ string) {
+	var req struct {
+		RuleID     string `json:"rule_id"`
+		Name       string `json:"name"`
+		DeviceID   string `json:"device_id"`
+		Kind       string `json:"kind"`
+		KeyName    string `json:"key_name"`
+		Op         string `json:"op"`
+		Value      string `json:"value"`
+		WebhookURL string `json:"webhook_url"`
+		AlarmLevel string `json:"alarm_level"`
+		Enabled    *bool  `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	if req.RuleID == "" || req.DeviceID == "" || req.Kind == "" || req.KeyName == "" || req.Op == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rule_id, device_id, kind, key_name, op required"})
+		return
+	}
+	params := map[string]string{
+		"rule_id": req.RuleID, "device_id": req.DeviceID, "kind": req.Kind,
+		"key_name": req.KeyName, "op": req.Op, "value": req.Value,
+		"webhook_url": req.WebhookURL, "alarm_level": req.AlarmLevel,
+	}
+	if req.Name != "" {
+		params["name"] = req.Name
+	}
+	if req.Enabled != nil && !*req.Enabled {
+		params["enabled"] = "false"
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.rule.create", params)
+	if err != nil || resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "rule.create", req.RuleID, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": resp.Params["error"]})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": resp.Ret})
+	g.auditLog(c.Request.Context(), keyID, "rule.create", req.RuleID, "ok", "")
+}
 
-	return mux
+func (g *gateway) ginRuleDelete(c *gin.Context, keyID, _ string) {
+	ruleID := c.Param("rule_id")
+	if ruleID == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.rule.delete", map[string]string{"rule_id": ruleID})
+	if err != nil || resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "rule.delete", ruleID, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": resp.Ret})
+	g.auditLog(c.Request.Context(), keyID, "rule.delete", ruleID, "ok", "")
+}
+
+func (g *gateway) ginAlarmAck(c *gin.Context, keyID, _ string) {
+	alarmID := c.Param("alarm_id")
+	if alarmID == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.alarm.ack", map[string]string{"alarm_id": alarmID})
+	if err != nil || resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "alarm.ack", alarmID, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": resp.Ret})
+	g.auditLog(c.Request.Context(), keyID, "alarm.ack", alarmID, "ok", "")
+}
+
+func (g *gateway) ginAuthValidate(c *gin.Context) {
+	key := getAPIKeyFromRequest(c.Request)
+	if key == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing api key"})
+		return
+	}
+	for _, b := range bootstrapAPIKeys {
+		if b == key {
+			c.JSON(http.StatusOK, gin.H{"key_id": "env", "role": "admin", "name": "bootstrap"})
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.apikey.validate", map[string]string{"api_key": key})
+	if err != nil || resp.Params["error"] != "" || resp.Ret != "ok" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid api key"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"key_id": resp.Params["key_id"],
+		"role":   resp.Params["role"],
+		"name":   resp.Params["name"],
+	})
+}
+
+func (g *gateway) ginApikeysList(c *gin.Context, keyID, _ string) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.apikey.list", nil)
+	if err != nil || resp.Params["error"] != "" {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	keys := parseApikeyLines(resp.Ret)
+	c.JSON(http.StatusOK, gin.H{"data": keys})
+	g.auditLog(c.Request.Context(), keyID, "apikey.list", "", "ok", "")
+}
+
+func (g *gateway) ginApikeysCreate(c *gin.Context, keyID, role string) {
+	if role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	var req struct {
+		KeyID string `json:"key_id"`
+		Name  string `json:"name"`
+		Role  string `json:"role"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	if req.KeyID == "" {
+		b := make([]byte, 8)
+		rand.Read(b)
+		req.KeyID = "key_" + hex.EncodeToString(b)
+	}
+	if req.Role == "" {
+		req.Role = "operator"
+	}
+	apiKey := make([]byte, 32)
+	rand.Read(apiKey)
+	rawKey := hex.EncodeToString(apiKey)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.apikey.create", map[string]string{
+		"key_id": req.KeyID, "api_key": rawKey, "name": req.Name, "role": req.Role,
+	})
+	if err != nil || resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "apikey.create", req.KeyID, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": resp.Params["error"]})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"key_id": req.KeyID, "api_key": rawKey, "name": req.Name, "role": req.Role})
+	g.auditLog(c.Request.Context(), keyID, "apikey.create", req.KeyID, "ok", "")
+}
+
+func (g *gateway) ginApikeyDelete(c *gin.Context, keyID, role string) {
+	if role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	toDelete := c.Param("key_id")
+	if toDelete == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := g.yate.call(ctx, "iot.apikey.delete", map[string]string{"key_id": toDelete})
+	if err != nil || resp.Params["error"] != "" {
+		g.auditLog(c.Request.Context(), keyID, "apikey.delete", toDelete, "error", "")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "yate error"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": resp.Ret})
+	g.auditLog(c.Request.Context(), keyID, "apikey.delete", toDelete, "ok", "")
+}
+
+func (g *gateway) ginTelemetryIngest(c *gin.Context) {
+	device := c.Param("device")
+	kind := c.Param("kind")
+	if kind != "telemetry" && kind != "attributes" && kind != "heartbeat" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	token := c.GetHeader("X-Token")
+	if token == "" {
+		token = c.Query("token")
+	}
+	body, _ := io.ReadAll(io.LimitReader(c.Request.Body, maxHTTPBodySize))
+	if len(bytes.TrimSpace(body)) == 0 {
+		body = []byte("{}")
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	ok, _ := g.yateUplink(ctx, device, token, "http", kind, time.Now().Unix(), body, false)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized or error"})
+		return
+	}
+	c.Status(http.StatusAccepted)
+	c.Writer.Write([]byte("ok"))
 }
 
 // ---- CoAP ----
@@ -1218,15 +1355,97 @@ func (g *gateway) startCoAP(addr string) error {
 // maxHTTPBodySize is the maximum request body size for HTTP telemetry/attributes (bytes). Default 1MB.
 var maxHTTPBodySize int64 = 1024 * 1024
 
+// requireAPIKey: when true, management APIs require X-API-Key or Authorization: Bearer.
+var requireAPIKey = true
+
+// bootstrapAPIKeys: keys from env API_KEY or API_KEYS (comma-separated), accepted as role "admin" without DB lookup.
+var bootstrapAPIKeys []string
+
+func init() {
+	if v := os.Getenv("API_KEY"); v != "" {
+		bootstrapAPIKeys = append(bootstrapAPIKeys, v)
+	}
+	if v := os.Getenv("API_KEYS"); v != "" {
+		for _, s := range strings.Split(v, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				bootstrapAPIKeys = append(bootstrapAPIKeys, s)
+			}
+		}
+	}
+}
+
+func getAPIKeyFromRequest(r *http.Request) string {
+	if k := r.Header.Get("X-API-Key"); k != "" {
+		return k
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+// requireManagementAuth returns (keyID, role, nil) or ("", "", error). pathHint e.g. "devices", "rules", "apikeys".
+func (g *gateway) requireManagementAuth(r *http.Request, method, pathHint string) (keyID, role string, err error) {
+	key := getAPIKeyFromRequest(r)
+	if key == "" {
+		if requireAPIKey {
+			return "", "", errors.New("missing api key")
+		}
+		return "anonymous", "admin", nil
+	}
+	for _, b := range bootstrapAPIKeys {
+		if b == key {
+			return "env", "admin", nil
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	resp, callErr := g.yate.call(ctx, "iot.apikey.validate", map[string]string{"api_key": key})
+	if callErr != nil || resp.Params["error"] != "" || resp.Ret != "ok" {
+		return "", "", errors.New("invalid api key")
+	}
+	keyID = resp.Params["key_id"]
+	role = resp.Params["role"]
+	if role == "" {
+		role = "operator"
+	}
+	// apikey management: admin only
+	if pathHint == "apikeys" && method != http.MethodGet && role != "admin" {
+		return "", "", errors.New("forbidden")
+	}
+	// readonly: GET only
+	if role == "readonly" && method != http.MethodGet {
+		return "", "", errors.New("forbidden")
+	}
+	return keyID, role, nil
+}
+
+func (g *gateway) auditLog(ctx context.Context, actorID, action, targetID, result, details string) {
+	if actorID == "" {
+		actorID = "anonymous"
+	}
+	_, _ = g.yate.call(ctx, "iot.audit.log", map[string]string{
+		"actor_type": "api_key",
+		"actor_id":   actorID,
+		"action":     action,
+		"target_id":  targetID,
+		"result":     result,
+		"details":    details,
+	})
+}
+
 func main() {
 	var (
-		yateAddr   = flag.String("yate", getenv("YATE_ADDR", "127.0.0.1:5040"), "Yate extmodule listener address (host:port)")
-		httpAddr   = flag.String("http", getenv("HTTP_ADDR", ":8088"), "HTTP listen address")
-		coapAddr   = flag.String("coap", getenv("COAP_ADDR", ":5683"), "CoAP listen address (UDP)")
-		mqttAddr   = flag.String("mqtt", getenv("MQTT_ADDR", ":1883"), "MQTT listen address")
-		maxBody    = flag.Int64("http-max-body", getenvInt64("HTTP_MAX_BODY", 1024*1024), "Max HTTP request body size for telemetry (bytes)")
+		yateAddr       = flag.String("yate", getenv("YATE_ADDR", "127.0.0.1:5040"), "Yate extmodule listener address (host:port)")
+		httpAddr       = flag.String("http", getenv("HTTP_ADDR", ":8088"), "HTTP listen address")
+		coapAddr       = flag.String("coap", getenv("COAP_ADDR", ":5683"), "CoAP listen address (UDP)")
+		mqttAddr       = flag.String("mqtt", getenv("MQTT_ADDR", ":1883"), "MQTT listen address")
+		maxBody        = flag.Int64("http-max-body", getenvInt64("HTTP_MAX_BODY", 1024*1024), "Max HTTP request body size for telemetry (bytes)")
+		requireKey     = flag.Bool("require-api-key", getenvBool("REQUIRE_API_KEY", true), "Require X-API-Key or Bearer for management APIs")
 	)
 	flag.Parse()
+	requireAPIKey = *requireKey
 	maxHTTPBodySize = *maxBody
 	if maxHTTPBodySize < 256 {
 		maxHTTPBodySize = 256
@@ -1333,6 +1552,14 @@ func getenvInt64(k string, def int64) int64 {
 		return def
 	}
 	return n
+}
+
+func getenvBool(k string, def bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	return strings.EqualFold(v, "true") || v == "1"
 }
 
 func waitSig() {
