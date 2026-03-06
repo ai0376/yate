@@ -425,6 +425,7 @@ IotDevModule::IotDevModule()
 IotDevModule::~IotDevModule()
 {
     Output("Unloaded module IoT Device Core");
+    // TelEngine::destruct(0) is a no-op; if unload() ran, handlers are already 0
     TelEngine::destruct(m_hAuth);
     TelEngine::destruct(m_hUplink);
     TelEngine::destruct(m_hDevCreate);
@@ -704,6 +705,29 @@ bool IotDevModule::unload()
     Engine::uninstall(m_hApikeyList);
     Engine::uninstall(m_hApikeyDelete);
     Engine::uninstall(m_hAuditLog);
+    TelEngine::destruct(m_hAuth);       m_hAuth = 0;
+    TelEngine::destruct(m_hUplink);    m_hUplink = 0;
+    TelEngine::destruct(m_hDevCreate);  m_hDevCreate = 0;
+    TelEngine::destruct(m_hDevDelete);  m_hDevDelete = 0;
+    TelEngine::destruct(m_hDevGet);     m_hDevGet = 0;
+    TelEngine::destruct(m_hDevList);    m_hDevList = 0;
+    TelEngine::destruct(m_hEventQuery); m_hEventQuery = 0;
+    TelEngine::destruct(m_hEventLatest); m_hEventLatest = 0;
+    TelEngine::destruct(m_hCommandSend); m_hCommandSend = 0;
+    TelEngine::destruct(m_hCommandList); m_hCommandList = 0;
+    TelEngine::destruct(m_hCommandMarkSent); m_hCommandMarkSent = 0;
+    TelEngine::destruct(m_hCommandAck); m_hCommandAck = 0;
+    TelEngine::destruct(m_hRuleCreate); m_hRuleCreate = 0;
+    TelEngine::destruct(m_hRuleList);   m_hRuleList = 0;
+    TelEngine::destruct(m_hRuleDelete); m_hRuleDelete = 0;
+    TelEngine::destruct(m_hAlarmCreate); m_hAlarmCreate = 0;
+    TelEngine::destruct(m_hAlarmList); m_hAlarmList = 0;
+    TelEngine::destruct(m_hAlarmAck);  m_hAlarmAck = 0;
+    TelEngine::destruct(m_hApikeyValidate); m_hApikeyValidate = 0;
+    TelEngine::destruct(m_hApikeyCreate); m_hApikeyCreate = 0;
+    TelEngine::destruct(m_hApikeyList); m_hApikeyList = 0;
+    TelEngine::destruct(m_hApikeyDelete); m_hApikeyDelete = 0;
+    TelEngine::destruct(m_hAuditLog);  m_hAuditLog = 0;
     unlock();
     return true;
 }
